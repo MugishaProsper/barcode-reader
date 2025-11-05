@@ -1,225 +1,208 @@
+#!/usr/bin/env python3
+"""
+Enhanced Windows Barcode Reader
+Supports 1D & 2D barcodes with advanced preprocessing and parallel processing.
+"""
+
 import os
-import cv2
 import csv
 import argparse
+import json
 from pathlib import Path
-from typing import List, Dict, Tuple, Optional
-from PIL import Image
-import numpy as np
-from pyzbar import pyzbar
+from typing import List, Dict
+import time
 
-# Supported barcode types (pyzbar)
-BARCODE_TYPES = {
-    'CODE39': 'Code 39',
-    'CODE128': 'Code 128',
-    'QRCODE': 'QR Code',
-    'EAN13': 'EAN-13',
-    'EAN8': 'EAN-8',
-    'UPCA': 'UPC-A',
-    'DATAMATRIX': 'Data Matrix',
-    'PDF417': 'PDF417',
-    'ITF': 'Interleaved 2 of 5',
-}
+from config import Config, load_config, save_config
+from logger import setup_logger
+from barcode_processor import BarcodeProcessor, process_images_parallel
 
-def preprocess_image(image: np.ndarray) -> List[np.ndarray]:
-    """Apply multiple preprocessing techniques"""
-    versions = []
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
+def find_images(input_path: Path, config: Config) -> List[Path]:
+    """Find all supported image files in the given path."""
+    images = []
+    
+    if input_path.is_dir():
+        for ext in config.supported_extensions:
+            images.extend(input_path.glob(f"*{ext}"))
+            images.extend(input_path.glob(f"*{ext.upper()}"))
+    else:
+        if input_path.suffix.lower() in config.supported_extensions:
+            images = [input_path]
+    
+    return sorted(images)
 
-    # 1. Original
-    versions.append(gray)
 
-    # 2. High contrast (CLAHE)
-    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
-    versions.append(clahe.apply(gray))
+def save_results(records: List[Dict], csv_path: Path, config: Config):
+    """Save results to CSV with proper encoding and formatting."""
+    fieldnames = [
+        'filename', 'index', 'type', 'data', 'x', 'y', 'width', 'height'
+    ]
+    
+    if config.output.include_confidence:
+        fieldnames.append('quality')
+    
+    with open(csv_path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(
+            f, 
+            fieldnames=fieldnames,
+            delimiter=config.output.csv_delimiter
+        )
+        writer.writeheader()
+        writer.writerows(records)
 
-    # 3. Binary threshold
-    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    versions.append(thresh)
 
-    # 4. Inverted
-    versions.append(cv2.bitwise_not(gray))
+def print_summary(records: List[Dict], processing_time: float):
+    """Print processing summary."""
+    total_files = len(set(r['filename'] for r in records))
+    total_barcodes = len([r for r in records if r['data'] not in ['NO BARCODE DETECTED', 'ERROR']])
+    error_files = len([r for r in records if r['type'] == 'ERROR'])
+    
+    print(f"\n{'='*50}")
+    print(f"PROCESSING SUMMARY")
+    print(f"{'='*50}")
+    print(f"Files processed: {total_files}")
+    print(f"Barcodes found: {total_barcodes}")
+    print(f"Files with errors: {error_files}")
+    print(f"Processing time: {processing_time:.2f}s")
+    print(f"{'='*50}")
 
-    # 5. Morphological
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3,3))
-    morphed = cv2.morphologyEx(gray, cv2.MORPH_CLOSE, kernel)
-    versions.append(morphed)
 
-    # 6. Sharpened
-    blur = cv2.GaussianBlur(gray, (0,0), 3)
-    sharpened = cv2.addWeighted(gray, 1.5, blur, -0.5, 0)
-    versions.append(sharpened)
-
-    return versions
-
-def decode_barcodes(image: np.ndarray) -> List[Dict]:
-    """Decode barcodes using pyzbar with preprocessing"""
-    preprocessed = preprocess_image(image)
-    all_barcodes = []
-
-    for proc in preprocessed:
-        barcodes = pyzbar.decode(proc, symbols=None)
-        for barcode in barcodes:
-            data = barcode.data.decode('utf-8', errors='ignore')
-            barcode_type = barcode.type
-            x, y, w, h = barcode.rect.left, barcode.rect.top, barcode.rect.width, barcode.rect.height
-
-            # Convert polygon to bounding box
-            points = barcode.polygon
-            if len(points) > 4:
-                hull = cv2.convexHull(np.array([p for p in points], dtype=np.float32))
-                hull = list(map(tuple, np.squeeze(hull)))
-            else:
-                hull = points
-
-            all_barcodes.append({
-                'data': data,
-                'type': barcode_type,
-                'type_name': BARCODE_TYPES.get(barcode_type, barcode_type),
-                'x': x, 'y': y, 'w': w, 'h': h,
-                'polygon': hull
-            })
-
-    # Remove duplicates
-    seen = set()
-    unique = []
-    for b in all_barcodes:
-        key = (b['data'], b['type'], b['x'], b['y'])
-        if key not in seen:
-            seen.add(key)
-            unique.append(b)
-    return unique
-
-def draw_barcodes(image: np.ndarray, barcodes: List[Dict], output_path: str):
-    """Draw bounding boxes and labels"""
-    img = image.copy()
-    for i, b in enumerate(barcodes):
-        x, y, w, h = b['x'], b['y'], b['w'], b['h']
-        color = (0, 255, 0)  # Green
-
-        # Draw rectangle
-        cv2.rectangle(img, (x, y), (x + w, y + h), color, 2)
-
-        # Draw polygon (more accurate for rotated codes)
-        if len(b['polygon']) >= 3:
-            pts = np.array(b['polygon'], np.int32)
-            cv2.polylines(img, [pts], isClosed=True, color=color, thickness=2)
-
-        # Label
-        label = f"{b['type_name']}: {b['data'][:30]}"
-        cv2.putText(img, label, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6, color, 2)
-
-    cv2.imwrite(output_path, img)
-
-def process_image(
-    img_path: str,
-    output_dir: str,
-    draw: bool
-) -> List[Dict]:
-    """Process one image"""
-    try:
-        image = cv2.imread(img_path)
-        if image is None:
-            raise ValueError("Failed to load image")
-
-        barcodes = decode_barcodes(image)
-        records = []
-
-        print(f"\n{Path(img_path).name}: Found {len(barcodes)} barcode(s)")
-
-        for i, b in enumerate(barcodes):
-            record = {
-                'filename': Path(img_path).name,
-                'index': i + 1,
-                'type': b['type_name'],
-                'data': b['data'],
-                'x': b['x'],
-                'y': b['y'],
-                'width': b['w'],
-                'height': b['h']
-            }
-            records.append(record)
-            print(f"  [{i+1}] {b['type_name']}: {b['data']}")
-
-        if draw and barcodes:
-            out_path = os.path.join(output_dir, f"scanned_{Path(img_path).name}")
-            draw_barcodes(image, barcodes, out_path)
-            print(f"  Saved annotated: {out_path}")
-
-        if not barcodes:
-            records.append({
-                'filename': Path(img_path).name,
-                'index': 0,
-                'type': '', 'data': 'NO BARCODE',
-                'x': '', 'y': '', 'width': '', 'height': ''
-            })
-
-        return records
-
-    except Exception as e:
-        print(f"Error: {img_path} -> {e}")
-        return [{
-            'filename': Path(img_path).name,
-            'index': 0,
-            'type': 'ERROR',
-            'data': str(e),
-            'x': '', 'y': '', 'width': '', 'height': ''
-        }]
+def create_default_config():
+    """Create a default configuration file."""
+    config = Config(
+        preprocessing=PreprocessingConfig(),
+        output=OutputConfig()
+    )
+    save_config(config)
+    print("Created default config.json file")
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Windows Barcode Reader (1D & 2D)",
+        description="Enhanced Windows Barcode Reader (1D & 2D)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python read_barcodes.py image.jpg --draw
-  python read_barcodes.py "C:\\Scans\\" -o results --csv all_barcodes.csv
+  python barcode_reader.py image.jpg --draw
+  python barcode_reader.py "C:\\Scans\\" -o results --csv all_barcodes.csv
+  python barcode_reader.py folder/ --parallel --workers 8 --log-level DEBUG
+  python barcode_reader.py --create-config  # Create default config file
         """
     )
-    parser.add_argument("input", help="Image file or folder")
+    
+    # Main arguments
+    parser.add_argument("input", nargs='?', help="Image file or folder")
     parser.add_argument("-o", "--output", default="barcode_results", help="Output folder")
     parser.add_argument("--csv", default="barcodes.csv", help="CSV output file")
-    parser.add_argument("--draw", action="store_true", help="Save images with boxes")
+    parser.add_argument("--draw", action="store_true", help="Save annotated images")
+    
+    # Performance options
+    parser.add_argument("--parallel", action="store_true", help="Enable parallel processing")
+    parser.add_argument("--workers", type=int, help="Number of worker threads (default: from config)")
+    
+    # Configuration options
+    parser.add_argument("--config", default="config.json", help="Configuration file path")
+    parser.add_argument("--create-config", action="store_true", help="Create default config file and exit")
+    
+    # Logging options
+    parser.add_argument("--log-level", choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'], 
+                       help="Logging level (default: from config)")
+    parser.add_argument("--log-file", help="Log file path")
+    parser.add_argument("--quiet", action="store_true", help="Suppress console output")
 
     args = parser.parse_args()
-
-    input_path = Path(args.input)
-    output_dir = Path(args.output)
-    output_dir.mkdir(exist_ok=True)
-
-    # Find images
-    if input_path.is_dir():
-        images = list(input_path.glob("*.png")) + \
-                 list(input_path.glob("*.jpg")) + \
-                 list(input_path.glob("*.jpeg")) + \
-                 list(input_path.glob("*.bmp")) + \
-                 list(input_path.glob("*.tiff"))
-    else:
-        images = [input_path]
-
-    if not images:
-        print("No images found!")
+    
+    # Handle config creation
+    if args.create_config:
+        create_default_config()
         return
-
-    all_records = []
-    for img in images:
-        records = process_image(str(img), str(output_dir), args.draw)
-        all_records.extend(records)
-
-    # Save CSV
+    
+    if not args.input:
+        parser.error("Input path is required (unless using --create-config)")
+    
+    # Load configuration
+    try:
+        config = load_config(args.config)
+    except Exception as e:
+        print(f"Error loading config: {e}")
+        print("Creating default configuration...")
+        config = Config(
+            preprocessing=PreprocessingConfig(),
+            output=OutputConfig()
+        )
+    
+    # Override config with command line arguments
+    if args.workers:
+        config.max_workers = args.workers
+    if args.log_level:
+        config.log_level = args.log_level
+    
+    # Setup logging
+    logger = setup_logger(
+        level=config.log_level,
+        log_file=args.log_file,
+        console_output=not args.quiet
+    )
+    
+    logger.info("Starting Enhanced Barcode Reader")
+    logger.info(f"Configuration: {args.config}")
+    
+    # Validate input path
+    input_path = Path(args.input)
+    if not input_path.exists():
+        logger.error(f"Input path does not exist: {input_path}")
+        return
+    
+    # Setup output directory
+    output_dir = Path(args.output)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Find images
+    images = find_images(input_path, config)
+    if not images:
+        logger.error("No supported images found!")
+        logger.info(f"Supported extensions: {', '.join(config.supported_extensions)}")
+        return
+    
+    logger.info(f"Found {len(images)} image(s) to process")
+    
+    # Initialize processor
+    processor = BarcodeProcessor(config)
+    
+    # Process images
+    start_time = time.time()
+    
+    if args.parallel and len(images) > 1:
+        logger.info(f"Processing images in parallel with {config.max_workers} workers")
+        all_records = process_images_parallel(
+            [str(img) for img in images], 
+            processor, 
+            str(output_dir), 
+            args.draw, 
+            config.max_workers
+        )
+    else:
+        logger.info("Processing images sequentially")
+        all_records = []
+        for img_path in images:
+            from barcode_processor import _process_single_image
+            records = _process_single_image(str(img_path), processor, str(output_dir), args.draw)
+            all_records.extend(records)
+    
+    processing_time = time.time() - start_time
+    
+    # Save results
     csv_path = Path(args.csv)
-    with open(csv_path, 'w', newline='', encoding='utf-8') as f:
-        writer = csv.DictWriter(f, fieldnames=[
-            'filename', 'index', 'type', 'data', 'x', 'y', 'width', 'height'
-        ])
-        writer.writeheader()
-        writer.writerows(all_records)
+    save_results(all_records, csv_path, config)
+    
+    # Print summary
+    if not args.quiet:
+        print_summary(all_records, processing_time)
+        print(f"\nResults saved to:")
+        print(f"  CSV: {csv_path.resolve()}")
+        if args.draw:
+            print(f"  Annotated images: {output_dir.resolve()}")
+    
+    logger.info("Processing completed successfully")
 
-    print(f"\nDone! Results saved to:")
-    print(f"  CSV: {csv_path.resolve()}")
-    if args.draw:
-        print(f"  Images: {output_dir.resolve()}")
 
 if __name__ == "__main__":
     main()
